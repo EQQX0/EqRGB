@@ -80,6 +80,7 @@ import media  # noqa: E402
 import pystray  # noqa: E402
 import qrcode  # noqa: E402
 import rgb  # noqa: E402
+import startup  # noqa: E402
 import updater  # noqa: E402
 import webview  # noqa: E402
 import winaccent  # noqa: E402
@@ -749,6 +750,49 @@ class Api:
         applog.event("phone_token_rotated", ok=True)
         return self.phone_info()
 
+    def get_settings(self):
+        a = self._app
+        mode = startup.current_mode()
+        if mode:
+            a.state["start_mode"] = mode  # the installer may have set the entry; the registry is the truth
+        return {"startup": startup.is_enabled(), "start_mode": a.state.get("start_mode", "tray"),
+                "close_action": a.state.get("close_action", "tray"),
+                "rescan_every_min": a.state.get("rescan_every_min", 0)}
+
+    def set_startup(self, on, mode=None):
+        a = self._app
+        if mode in ("tray", "window"):
+            a.state["start_mode"] = mode
+        try:
+            startup.set_enabled(bool(on), a.state.get("start_mode", "tray"), HERE)
+        except OSError as e:
+            log.exception("could not change the Windows startup entry")
+            return {"error": "Couldn't change startup: %s" % e}
+        rgb.save_state(a.state)
+        log.info("start with Windows %s (%s)", "ON" if on else "OFF", a.state.get("start_mode"))
+        return self.get_settings()
+
+    def set_close_action(self, action):
+        a = self._app
+        a.state["close_action"] = "quit" if action == "quit" else "tray"
+        rgb.save_state(a.state)
+        log.info("X button now: %s", a.state["close_action"])
+        return self.get_settings()
+
+    def set_rescan_every(self, minutes):
+        a = self._app
+        try:
+            n = int(minutes)
+        except (TypeError, ValueError):
+            return {"error": "Enter a whole number of minutes."}
+        if n < 0 or n > 1440:
+            return {"error": "Use 1 to 1440 minutes, or 0 to turn it off."}
+        a.state["rescan_every_min"] = n
+        a.periodic_at = time.time()  # count from now
+        rgb.save_state(a.state)
+        log.info("automatic rescan every %d min", n)
+        return self.get_settings()
+
     def set_sync_accent(self, on):
         a = self._app
         a.state["sync_accent"] = bool(on)
@@ -912,6 +956,10 @@ class App:
         self.busy_text = ""
         self.last_msg = ["", ""]
         self.state.setdefault("sync_accent", True)
+        self.state.setdefault("start_mode", "tray")
+        self.state.setdefault("close_action", "tray")
+        self.state.setdefault("rescan_every_min", 0)
+        self.periodic_at = time.time()
         self.accent_timer = None
         if not os.path.exists(ACCENT_BACKUP):
             with open(ACCENT_BACKUP, "w") as f:
@@ -1226,6 +1274,23 @@ class App:
                 log.exception("idle watcher hit an error (it keeps running)")
                 away = 0
             time.sleep(2)
+
+    def rescan_watch(self):
+        """Rescan every `rescan_every_min` minutes (Settings); 0 = off. Read each loop, so changes apply at once."""
+        while True:
+            try:
+                n = int(self.state.get("rescan_every_min", 0) or 0)
+                if n > 0 and time.time() - self.periodic_at >= n * 60:
+                    self.periodic_at = time.time()
+                    skip = ("not connected" if self.client is None else "iCUE is open" if icue.running()
+                            else "original mode" if self.state.get("mode") == "original" else None)
+                    log.info("scheduled rescan (every %d min); %s", n, "skipped: " + skip if skip else "rescanning")
+                    applog.event("periodic_rescan", ok=True, every_min=n, skipped=skip)
+                    if not skip:
+                        self.rescan()
+            except Exception:
+                log.exception("scheduled rescan hit an error (it keeps running)")
+            time.sleep(5)
 
     def resend_colors(self, why, delays):
         """Send the colors again at each of `delays` seconds from now. Not while the lights are handed back to the
@@ -1891,6 +1956,13 @@ class App:
         if self.quitting:
             log.info("window closing for real (quit)")
             return True
+        if self.state.get("close_action") == "quit":
+            log.info("X pressed; quitting (Settings: close = quit)")
+            if self.test_color:
+                self.test_color = None
+                self.jobs.put("apply")
+            threading.Thread(target=self.quit, daemon=True, name="quit").start()  # not from inside the closing event
+            return False
         log.info("window hidden to the tray")
         self.window.hide()
         if self.test_color:  # leaving mid-calibration: go back to the real colors
@@ -2192,7 +2264,8 @@ def main():
         for name, target in (("lights", app.rgb_worker), ("cooler-watch", app.cooler_watch), ("single-instance", listen),
                              ("icue-watch", functools.partial(icue.watch, app.rescan)), ("idle-watch", app.idle_watch),
                              ("wake-watch", app.wake_watch), ("keep-colors", app.keep_watch),
-                             ("health", app.health_watch), ("update-watch", app.update_watch)):
+                             ("health", app.health_watch), ("update-watch", app.update_watch),
+                             ("rescan-watch", app.rescan_watch)):
             if name == "idle-watch" and not IDLE_RESCAN:
                 continue
             if name == "keep-colors" and not KEEP_COLORS:
